@@ -9,6 +9,8 @@ export interface GraphNode {
   file_type?: string;
   source_file?: string;
   source_location?: string | null;
+  /** Community assignment stored per-node by graphify (networkX node_link_data) */
+  community?: number;
 }
 
 /** An edge between two nodes */
@@ -40,11 +42,10 @@ export interface Surprise {
   reason: string;
 }
 
-/** Full graphify graph.json shape */
+/** Full graphify graph.json shape (node_link_data format) */
 export interface GraphData {
   nodes: GraphNode[];
   links: GraphEdge[];
-  community?: Record<string, number>; // node_id → community_id
 }
 
 /** Per-node wiki page data after synthesis */

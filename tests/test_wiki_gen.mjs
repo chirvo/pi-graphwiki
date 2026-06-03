@@ -72,14 +72,15 @@ function setup() {
   mkdirSync(TMP_DIR, { recursive: true });
 
   // graph.json — minimal synthetic graph
+  // Real graphify output puts community on each node (networkX node_link_data)
   const graph = {
     nodes: [
-      { id: "app_main", label: "Main App", file_type: "code", source_file: "src/main.ts" },
-      { id: "app_auth", label: "Auth Module", file_type: "code", source_file: "src/auth.ts" },
-      { id: "app_db", label: "Database", file_type: "code", source_file: "src/db.ts" },
-      { id: "app_cache", label: "Cache Layer", file_type: "code", source_file: "src/cache.ts" },
-      { id: "doc_api", label: "API Docs", file_type: "document", source_file: "docs/api.md" },
-      { id: "doc_arch", label: "Architecture Doc", file_type: "document", source_file: "docs/arch.md" },
+      { id: "app_main", label: "Main App", file_type: "code", source_file: "src/main.ts", community: 0 },
+      { id: "app_auth", label: "Auth Module", file_type: "code", source_file: "src/auth.ts", community: 0 },
+      { id: "app_db", label: "Database", file_type: "code", source_file: "src/db.ts", community: 0 },
+      { id: "app_cache", label: "Cache Layer", file_type: "code", source_file: "src/cache.ts", community: 0 },
+      { id: "doc_api", label: "API Docs", file_type: "document", source_file: "docs/api.md", community: 1 },
+      { id: "doc_arch", label: "Architecture Doc", file_type: "document", source_file: "docs/arch.md", community: 1 },
     ],
     links: [
       { source: "app_main", target: "app_auth", relation: "imports", confidence: "EXTRACTED", weight: 1.0 },
@@ -92,14 +93,6 @@ function setup() {
       { source: "doc_arch", target: "app_db", relation: "describes", confidence: "EXTRACTED", weight: 0.8 },
       { source: "app_cache", target: "app_db", relation: "caches", confidence: "INFERRED", weight: 0.7 },
     ],
-    community: {
-      "app_main": 0,
-      "app_auth": 0,
-      "app_db": 0,
-      "app_cache": 0,
-      "doc_api": 1,
-      "doc_arch": 1,
-    },
   };
 
   writeFileSync(join(TMP_DIR, "graph.json"), JSON.stringify(graph, null, 2));

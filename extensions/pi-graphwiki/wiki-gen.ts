@@ -8,6 +8,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { createHash } from "node:crypto";
 import type {
   GraphData,
   GraphNode,
@@ -25,12 +26,31 @@ import type {
 // Helpers
 // ──────────────────────────────────────────────────────────────────────────
 
+/**
+ * Slugify with dedup: second call with a different label that produces the same
+ * slug appends a content hash suffix so wiki pages never silently overwrite.
+ */
+const _slugCache = new Map<string, string>();
 function slugify(label: string): string {
-  return label
+  const base = label
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-|-$/g, "")
     .slice(0, 80) || "unnamed";
+
+  // Check for collision
+  for (const [existingLabel, existingSlug] of _slugCache) {
+    if (existingSlug === base && existingLabel !== label) {
+      // Collision: append short hash of the label
+      const hash = createHash("md5").update(label).digest("hex").slice(0, 6);
+      const deduped = `${base}-${hash}`;
+      _slugCache.set(label, deduped);
+      return deduped;
+    }
+  }
+
+  _slugCache.set(label, base);
+  return base;
 }
 
 function escapeMd(text: string): string {
@@ -52,15 +72,79 @@ function jaccard(a: string[], b: string[]): number {
 // Load
 // ──────────────────────────────────────────────────────────────────────────
 
+// ──────────────────────────────────────────────────────────────────────────
+// Graph analysis: re-derive what graphify deletes after Step 9
+// ──────────────────────────────────────────────────────────────────────────
+
+/**
+ * graphify explicitly deletes `.graphify_analysis.json` in its cleanup step.
+ * This function re-derives what we need directly from graph.json:
+ * - community assignments (embedded in graph.json)
+ * - degree centrality (god nodes ≈ high-degree nodes)
+ * - cross-community surprising connections
+ */
+function deriveAnalysis(graph: GraphData): {
+  nodeToCommunity: Map<string, number>;
+  godNodeSet: Set<string>;
+  surprises: Surprise[];
+} {
+  // 1. Community mapping — graphify stores community on each node (networkX
+  //    node_link_data format). If missing, every node is community 0.
+  const nodeToCommunity = new Map<string, number>();
+  const communitySet = new Set<number>();
+
+  for (const node of graph.nodes) {
+    const cid = node.community ?? 0;
+    nodeToCommunity.set(node.id, cid);
+    communitySet.add(cid);
+  }
+
+  // 2. Degree-1.5 centrality to find god nodes
+  //    (networks with nodes-and-links topology: degree centrality is sufficient)
+  const degree = new Map<string, number>();
+  for (const node of graph.nodes) degree.set(node.id, 0);
+  for (const edge of graph.links) {
+    degree.set(edge.source, (degree.get(edge.source) || 0) + 1);
+    degree.set(edge.target, (degree.get(edge.target) || 0) + 1);
+  }
+
+  // God nodes: top 10% by degree, minimum 2 connections
+  const sortedDegrees = [...degree.entries()]
+    .filter(([, d]) => d >= 2)
+    .sort((a, b) => b[1] - a[1]);
+  const topCount = Math.max(1, Math.ceil(sortedDegrees.length * 0.1));
+  const godNodeSet = new Set(sortedDegrees.slice(0, topCount).map(([id]) => id));
+
+  // 3. Cross-community surprising connections:
+  //    edges whose source and target belong to different communities
+  const surprises: Surprise[] = [];
+  if (nodeToCommunity.size > 0) {
+    for (const edge of graph.links) {
+      const srcComm = nodeToCommunity.get(edge.source);
+      const tgtComm = nodeToCommunity.get(edge.target);
+      if (srcComm !== undefined && tgtComm !== undefined && srcComm !== tgtComm) {
+        const srcLabel = graph.nodes.find((n) => n.id === edge.source)?.label || edge.source;
+        const tgtLabel = graph.nodes.find((n) => n.id === edge.target)?.label || edge.target;
+        surprises.push({
+          source: edge.source,
+          target: edge.target,
+          relation: edge.relation,
+          communities: [String(srcComm), String(tgtComm)],
+          reason: `${srcLabel} (community ${srcComm}) connects to ${tgtLabel} (community ${tgtComm}) via ${edge.relation}`,
+        });
+      }
+    }
+  }
+
+  return { nodeToCommunity, godNodeSet, surprises };
+}
+
 interface LoadedData {
   graph: GraphData;
   nodesById: Map<string, GraphNode>;
-  analysis: GraphAnalysis | null;
   nodeToCommunity: Map<string, number>;
-  communityLabels: Map<number, string>;
   godNodeSet: Set<string>;
-  surprisesBySource: Map<string, Surprise[]>;
-  surprisesByTarget: Map<string, Surprise[]>;
+  surprises: Surprise[];
 }
 
 function loadData(graphDir: string): LoadedData {
@@ -77,68 +161,15 @@ function loadData(graphDir: string): LoadedData {
     nodesById.set(n.id, n);
   }
 
-  // Try to load analysis
-  let analysis: GraphAnalysis | null = null;
-  const analysisPath = path.join(graphDir, ".graphify_analysis.json");
-  if (fs.existsSync(analysisPath)) {
-    try {
-      analysis = JSON.parse(fs.readFileSync(analysisPath, "utf-8"));
-    } catch {
-      // Non-fatal — analysis is optional
-    }
-  }
-
-  // Community mapping: node_id → community_id
-  const nodeToCommunity = new Map<string, number>();
-  const communityLabels = new Map<number, string>();
-
-  if (analysis?.communities) {
-    for (const [cidStr, nodeIds] of Object.entries(analysis.communities)) {
-      const cid = Number(cidStr);
-      for (const nid of nodeIds) {
-        nodeToCommunity.set(nid, cid);
-      }
-    }
-  }
-
-  // Fallback: use inline community mapping from graph.json
-  if (nodeToCommunity.size === 0 && graph.community) {
-    for (const [nid, cid] of Object.entries(graph.community)) {
-      nodeToCommunity.set(nid, cid);
-    }
-  }
-
-  // God nodes set
-  const godNodeSet = new Set<string>();
-  if (analysis?.gods) {
-    for (const g of analysis.gods) {
-      godNodeSet.add(g.node);
-    }
-  }
-
-  // Index surprising connections
-  const surprisesBySource = new Map<string, Surprise[]>();
-  const surprisesByTarget = new Map<string, Surprise[]>();
-  if (analysis?.surprises) {
-    for (const s of analysis.surprises) {
-      const src = surprisesBySource.get(s.source) || [];
-      src.push(s);
-      surprisesBySource.set(s.source, src);
-      const tgt = surprisesByTarget.get(s.target) || [];
-      tgt.push(s);
-      surprisesByTarget.set(s.target, tgt);
-    }
-  }
+  // Derive everything from graph.json — graphify deletes analysis files
+  const { nodeToCommunity, godNodeSet, surprises } = deriveAnalysis(graph);
 
   return {
     graph,
     nodesById,
-    analysis,
     nodeToCommunity,
-    communityLabels,
     godNodeSet,
-    surprisesBySource,
-    surprisesByTarget,
+    surprises,
   };
 }
 
@@ -149,7 +180,7 @@ function loadData(graphDir: string): LoadedData {
 function buildNodeWikis(data: LoadedData): NodeWiki[] {
   const { graph, nodesById, nodeToCommunity, godNodeSet, surprisesBySource, surprisesByTarget } = data;
 
-  // Build adjacency
+  // Build adjacency — single pass, O(E)
   const outgoing = new Map<string, SynthesizedEdge[]>();
   const incoming = new Map<string, SynthesizedEdge[]>();
 
@@ -185,12 +216,11 @@ function buildNodeWikis(data: LoadedData): NodeWiki[] {
     const outEdges = outgoing.get(node.id) || [];
     const inEdges = incoming.get(node.id) || [];
     const communityId = nodeToCommunity.get(node.id) ?? null;
-    const godScore =
-      data.analysis?.gods?.find((g) => g.node === node.id)?.score ?? null;
-    const surprises = [
-      ...(surprisesBySource.get(node.id) || []),
-      ...(surprisesByTarget.get(node.id) || []),
-    ];
+    const isGod = data.godNodeSet.has(node.id);
+    // Find surprises involving this node by node ID (not slug)
+    const surprises = data.surprises.filter(
+      (s) => s.source === node.id || s.target === node.id
+    );
 
     wikis.push({
       slug: slugify(node.label),
@@ -200,8 +230,8 @@ function buildNodeWikis(data: LoadedData): NodeWiki[] {
       communityId,
       communityLabel: communityId !== null ? `Community ${communityId}` : null,
       degree: outEdges.length + inEdges.length,
-      isGodNode: godNodeSet.has(node.id),
-      godScore,
+      isGodNode: isGod,
+      godScore: isGod ? degreeFromEdges(outEdges.length + inEdges.length) : null,
       outgoingEdges: outEdges,
       incomingEdges: inEdges,
       surprisingConnections: surprises,
@@ -226,38 +256,67 @@ function buildCommunityWikis(nodeWikis: NodeWiki[], data: LoadedData): Community
   }
 
   const result: CommunityWiki[] = [];
-  const cohesion = data.analysis?.cohesion || {};
 
-  // Detect bridge nodes — nodes in this community that connect to other communities
+  // Compute cohesion per community: fraction of edges that stay within community
+  const cohesion = new Map<number, number>();
+  for (const [cid, members] of communities) {
+    const memberIds = new Set(members.map((m) => m.label));
+    let internal = 0;
+    let total = 0;
+    for (const m of members) {
+      for (const e of m.outgoingEdges) {
+        total++;
+        if (memberIds.has(e.targetLabel)) internal++;
+      }
+    }
+    cohesion.set(cid, total > 0 ? internal / total : 0);
+  }
+
   const communityIds = [...communities.keys()].sort((a, b) => a - b);
 
   for (const cid of communityIds) {
     const members = communities.get(cid)!;
     const slug = slugify(`Community ${cid}`);
 
-    // Bridge detection: find nodes whose outgoing edges go to other communities
+    // Bridge detection via node ID — use data.surprises which is already
+    // derived from cross-community edges in graph.json
     const bridgeNodes: CommunityWiki["bridgeNodes"] = [];
-    const memberIdSet = new Set(members.map((m) => slugify(m.label)));
+    const memberNodeIds = new Map<string, NodeWiki>();
+    for (const nw of nodeWikis) {
+      if (nw.communityId === cid) {
+        // Find the actual node ID for this wiki page
+        const graphNode = data.graph.nodes.find((n) => slugify(n.label) === nw.slug);
+        if (graphNode) memberNodeIds.set(graphNode.id, nw);
+      }
+    }
 
-    for (const m of members) {
-      for (const edge of m.outgoingEdges) {
-        // Check if edge target belongs to another community
-        const targetIsMember = memberIdSet.has(edge.targetSlug);
-        if (!targetIsMember) {
-          bridgeNodes.push({
-            nodeLabel: m.label,
-            nodeSlug: m.slug,
-            toCommunity: edge.targetLabel,
-            relation: edge.relation,
-          });
-        }
+    for (const s of data.surprises) {
+      if (memberNodeIds.has(s.source)) {
+        const src = memberNodeIds.get(s.source)!;
+        const tgtLabel = data.nodesById.get(s.target)?.label || s.target;
+        bridgeNodes.push({
+          nodeLabel: src.label,
+          nodeSlug: src.slug,
+          toCommunity: tgtLabel,
+          relation: s.relation,
+        });
+      }
+      if (memberNodeIds.has(s.target)) {
+        const tgt = memberNodeIds.get(s.target)!;
+        const srcLabel = data.nodesById.get(s.source)?.label || s.source;
+        bridgeNodes.push({
+          nodeLabel: tgt.label,
+          nodeSlug: tgt.slug,
+          toCommunity: srcLabel,
+          relation: s.relation,
+        });
       }
     }
 
     result.push({
       id: slug,
       label: `Community ${cid}`,
-      cohesion: cohesion[cid] ?? 0,
+      cohesion: cohesion.get(cid) ?? 0,
       nodeCount: members.length,
       memberSummaries: members.map((m) => ({
         label: m.label,
@@ -265,16 +324,47 @@ function buildCommunityWikis(nodeWikis: NodeWiki[], data: LoadedData): Community
         fileType: m.fileType,
         isGodNode: m.isGodNode,
       })),
-      bridgeNodes,
+      bridgeNodes: dedupeBridges(bridgeNodes),
     });
   }
 
   return result;
 }
 
+/** Remove duplicate bridge entries for the same node+target */
+function dedupeBridges(bridges: CommunityWiki["bridgeNodes"]): CommunityWiki["bridgeNodes"] {
+  const seen = new Set<string>();
+  return bridges.filter((b) => {
+    const key = `${b.nodeLabel}->${b.toCommunity}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
 // ──────────────────────────────────────────────────────────────────────────
 // Build comparison pages
 // ──────────────────────────────────────────────────────────────────────────
+
+/** Pre-compute neighbor sets by node ID for fast comparison */
+function buildNeighborMap(data: LoadedData): Map<string, string[]> {
+  const map = new Map<string, Set<string>>();
+  for (const node of data.graph.nodes) map.set(node.id, new Set());
+  for (const edge of data.graph.links) {
+    map.get(edge.source)?.add(edge.target);
+    map.get(edge.target)?.add(edge.source);
+  }
+  const result = new Map<string, string[]>();
+  for (const [id, neighbors] of map) {
+    result.set(
+      id,
+      [...neighbors]
+        .map((nid) => data.nodesById.get(nid)?.label || nid)
+        .filter(Boolean)
+    );
+  }
+  return result;
+}
 
 function buildComparisons(nodeWikis: NodeWiki[], data: LoadedData): Comparison[] {
   const comparisons: Comparison[] = [];
@@ -287,11 +377,10 @@ function buildComparisons(nodeWikis: NodeWiki[], data: LoadedData): Comparison[]
     byCommunity.set(nw.communityId, list);
   }
 
-  const nodeIds = data.graph.nodes.map((n) => n.id);
-  const nodeLabelMap = new Map(data.graph.nodes.map((n) => [n.id, n.label]));
+  // Pre-build neighbor map (O(E) once instead of O(E) per pair)
+  const neighborByLabel = buildNeighborMap(data);
+  const labelToId = new Map(data.graph.nodes.map((n) => [n.label, n.id]));
 
-  // Cross-community structural rivals: find nodes from different communities
-  // that share many neighbors (they likely solve similar problems)
   const communityIds = [...byCommunity.keys()].filter((k) => k !== null) as number[];
   if (communityIds.length >= 2) {
     for (let i = 0; i < communityIds.length; i++) {
@@ -299,27 +388,17 @@ function buildComparisons(nodeWikis: NodeWiki[], data: LoadedData): Comparison[]
         const ci = byCommunity.get(communityIds[i]) || [];
         const cj = byCommunity.get(communityIds[j]) || [];
 
-        // Compare high-degree nodes across communities
         const topI = [...ci].sort((a, b) => b.degree - a.degree).slice(0, 5);
         const topJ = [...cj].sort((a, b) => b.degree - a.degree).slice(0, 5);
 
         for (const a of topI) {
+          const aNeighbors = neighborByLabel.get(labelToId.get(a.label) ?? "") || [];
           for (const b of topJ) {
-            const aNeighbors = data.graph.links
-              .filter((e) => e.source === data.graph.nodes.find((n) => n.label === a.label)?.id || e.target === data.graph.nodes.find((n) => n.label === a.label)?.id)
-              .map((e) => e.source === data.graph.nodes.find((n) => n.label === a.label)?.id ? e.target : e.source);
-            const bNeighbors = data.graph.links
-              .filter((e) => e.source === data.graph.nodes.find((n) => n.label === b.label)?.id || e.target === data.graph.nodes.find((n) => n.label === b.label)?.id)
-              .map((e) => e.source === data.graph.nodes.find((n) => n.label === b.label)?.id ? e.target : e.source);
-
-            // Get actual neighbor labels
-            const aNeighborLabels = aNeighbors.map((nid) => nodeLabelMap.get(nid) || nid).filter(Boolean);
-            const bNeighborLabels = bNeighbors.map((nid) => nodeLabelMap.get(nid) || nid).filter(Boolean);
-
-            const sim = jaccard(aNeighborLabels, bNeighborLabels);
+            const bNeighbors = neighborByLabel.get(labelToId.get(b.label) ?? "") || [];
+            const sim = jaccard(aNeighbors, bNeighbors);
 
             if (sim >= 0.3) {
-              const shared = aNeighborLabels.filter((l) => bNeighborLabels.includes(l));
+              const shared = aNeighbors.filter((l) => bNeighbors.includes(l));
               comparisons.push({
                 a: { label: a.label, slug: a.slug },
                 b: { label: b.label, slug: b.slug },
@@ -335,9 +414,30 @@ function buildComparisons(nodeWikis: NodeWiki[], data: LoadedData): Comparison[]
     }
   }
 
-  // Sort by similarity DESC, take top 20
   comparisons.sort((a, b) => b.similarity - a.similarity);
   return comparisons.slice(0, 20);
+}
+
+/** Generate a one-line prose description from a node's edges */
+function synthesizeRole(nw: NodeWiki): string | null {
+  if (nw.outgoingEdges.length === 0 && nw.incomingEdges.length === 0) return null;
+
+  const parts: string[] = [];
+  if (nw.outgoingEdges.length > 0) {
+    const targets = [...new Set(nw.outgoingEdges.map((e) => e.targetLabel))];
+    parts.push(`${nw.label} connects to ${targets.join(", ")}`);
+  }
+  if (nw.incomingEdges.length > 0) {
+    const sources = [...new Set(nw.incomingEdges.map((e) => e.targetLabel))];
+    parts.push(`is referenced by ${sources.join(", ")}`);
+  }
+  return [parts.join("; "), "."].join("");
+}
+
+/** Simple degree-derived score for god nodes without analysis file */
+function degreeFromEdges(degree: number): number {
+  // Normalize: degree 1-2 = 0.2, 3-5 = 0.5, 6+ = 0.8 (cap at 0.95)
+  return Math.min(0.95, degree * 0.15 + 0.1);
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -371,6 +471,13 @@ function renderNodeWiki(nw: NodeWiki): string {
     lines.push("");
   }
 
+  // Prose summary
+  const role = synthesizeRole(nw);
+  if (role) {
+    lines.push(role);
+    lines.push("");
+  }
+
   // Relationship table
   if (nw.outgoingEdges.length > 0 || nw.incomingEdges.length > 0) {
     lines.push("## Relationships");
@@ -390,14 +497,16 @@ function renderNodeWiki(nw: NodeWiki): string {
     lines.push("");
   }
 
-  // Surprising connections
+  // Surprising connections (matched by node ID, not slug)
   if (nw.surprisingConnections.length > 0) {
     lines.push("## Surprising Connections");
     lines.push("");
     for (const s of nw.surprisingConnections) {
-      const other = s.source === slugify(nw.label) ? s.target : s.source;
-      const otherNode = other; // best effort — it's an ID
-      lines.push(`- **[${other}](${slugify(other)}.md)** — ${s.relation} (${s.reason})`);
+      // s.source and s.target are graph node IDs, e.g. "app_main"
+      const isSource = s.source === nw.surprisingConnections[0]?.source; // context from caller
+      // Determine which end of the edge IS this node, and which is the "other"
+      // We need actual graph node IDs, not slugs. Pass via closure.
+      lines.push(`- → ${escapeMd(s.reason)}`);
     }
     lines.push("");
   }
@@ -516,8 +625,6 @@ export interface GenerateOptions {
   wikiDir?: string;
   /** Only generate INDEX.md (skip per-node/community/comparison) */
   indexOnly?: boolean;
-  /** Community label overrides: community_id → label */
-  communityLabels?: Record<string, string>;
 }
 
 /**
@@ -530,6 +637,9 @@ export function generateWiki(options: GenerateOptions): WikiGenResult {
   const graphDir = options.graphDir;
   const wikiDir = options.wikiDir || path.join(graphDir, "wiki");
 
+  // Reset slug cache on each generation (avoid stale collisions across runs)
+  _slugCache.clear();
+
   // Validate graphify output exists
   const graphPath = path.join(graphDir, "graph.json");
   if (!fs.existsSync(graphPath)) {
@@ -539,15 +649,9 @@ export function generateWiki(options: GenerateOptions): WikiGenResult {
     );
   }
 
-  // Load
+  // Load + derive everything from graph.json
+  // (graphify deletes .graphify_analysis.json in Step 9, so we derive)
   const data = loadData(graphDir);
-
-  // Apply custom community labels from options
-  if (options.communityLabels) {
-    for (const [cid, label] of Object.entries(options.communityLabels)) {
-      data.communityLabels.set(Number(cid), label);
-    }
-  }
 
   // Build wiki data
   const nodeWikis = buildNodeWikis(data);
@@ -574,9 +678,8 @@ export function generateWiki(options: GenerateOptions): WikiGenResult {
 
     // Write community pages
     for (const cw of communityWikis) {
-      const labelOverride = cw.id ? data.communityLabels.get(Number(cw.id.split("-").pop()) ?? null) ?? null : null;
       const filePath = path.join(communitiesDir, `_${cw.id}.md`);
-      fs.writeFileSync(filePath, renderCommunityWiki(cw, labelOverride), "utf-8");
+      fs.writeFileSync(filePath, renderCommunityWiki(cw, null), "utf-8");
       generatedFiles.push(filePath);
     }
 

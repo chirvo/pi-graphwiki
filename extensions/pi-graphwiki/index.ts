@@ -3,11 +3,12 @@
  *
  * Registers:
  * - `graphwiki_generate` tool — generate wiki from graphify output
- * - `graphwiki_index` tool — index existing wiki into mempalace
- * - `/graphwiki` command — quick operations (status, generate, reindex)
+ * - `graphwiki_status` tool — show generation status and indexing instructions
+ * - `/graphwiki` command — quick operations (status, generate)
  *
  * Architecture: standalone pi extension. Does NOT fork or patch graphify.
- * Reads graphify's standard output format (graph.json + analysis).
+ * Reads graphify's standard output format (graph.json only — analysis files
+ * are deleted by graphify's post-processing, so everything is re-derived).
  */
 
 import type { ExtensionAPI, ToolResult } from "@mariozechner/pi-coding-agent";
@@ -21,13 +22,9 @@ import { generateWiki, type GenerateOptions } from "./wiki-gen.js";
 // ──────────────────────────────────────────────────────────────────────────
 
 interface GraphWikiState {
-  /** Path to the last graphify-out directory we processed */
   lastGraphDir: string | null;
-  /** Path to the last wiki directory we generated */
   lastWikiDir: string | null;
-  /** Number of nodes in last generation */
   lastNodeCount: number;
-  /** Whether the wiki has been indexed into mempalace */
   indexed: boolean;
 }
 
@@ -43,7 +40,6 @@ const state: GraphWikiState = {
 // ──────────────────────────────────────────────────────────────────────────
 
 function findNearestGraphDir(cwd: string): string | null {
-  // Walk up from cwd looking for a graphify-out directory
   let dir = cwd;
   for (let i = 0; i < 5; i++) {
     const candidate = path.join(dir, "graphify-out");
@@ -59,13 +55,29 @@ function findNearestGraphDir(cwd: string): string | null {
 
 function buildStatusText(): string {
   if (!state.lastGraphDir) return "No wiki generated yet";
-  const lines: string[] = [
+  return [
     `Graph dir: ${state.lastGraphDir}`,
     `Wiki dir: ${state.lastWikiDir || "N/A"}`,
     `Nodes wikified: ${state.lastNodeCount}`,
     `Indexed in mempalace: ${state.indexed ? "yes" : "no"}`,
-  ];
-  return lines.join("\n");
+  ].join("\n");
+}
+
+function countWikiFiles(wikiDir: string): number {
+  let count = 0;
+  const walk = (dir: string) => {
+    if (!fs.existsSync(dir)) return;
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const fullPath = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        walk(fullPath);
+      } else if (entry.name.endsWith(".md")) {
+        count++;
+      }
+    }
+  };
+  walk(wikiDir);
+  return count;
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -80,11 +92,12 @@ export default function (pi: ExtensionAPI) {
     description:
       "Generate a self-curating wiki from graphify output. " +
       "Reads graphify-out/graph.json and produces concept pages, community " +
-      "overviews, comparisons, and a glossary index. Optionally indexes into mempalace.",
+      "overviews, comparisons, and a glossary index. " +
+      "After generation, index into mempalace with: ctx_index(path, source=\"graphify-wiki\")",
     promptSnippet: "Generate wiki docs from a knowledge graph",
     promptGuidelines: [
       "Use graphwiki_generate after graphify has finished building a graph.",
-      "The wiki is written to graphify-out/wiki/ and can be indexed into mempalace.",
+      "After generation, index the wiki into mempalace with ctx_index for semantic search.",
     ],
     parameters: Type.Object({
       graphDir: Type.Optional(
@@ -100,23 +113,14 @@ export default function (pi: ExtensionAPI) {
             "Override wiki output directory. Defaults to <graphDir>/wiki/.",
         })
       ),
-      index: Type.Optional(
-        Type.Boolean({
-          description:
-            "Whether to index the wiki into mempalace after generation. " +
-            "Default: false. Use graphwiki_index separately if unsure.",
-          default: false,
-        })
-      ),
     }),
     async execute(
       toolCallId: string,
-      params: { graphDir?: string; outputDir?: string; index?: boolean },
+      params: { graphDir?: string; outputDir?: string },
       signal: AbortSignal,
       onUpdate: ((update: ToolResult) => void) | undefined,
       _ctx: unknown
     ): Promise<ToolResult> {
-      // Resolve graphify output directory
       const graphDir =
         params.graphDir ||
         findNearestGraphDir(process.cwd()) ||
@@ -136,7 +140,6 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      // Generate wiki
       const opts: GenerateOptions = {
         graphDir,
         wikiDir: params.outputDir,
@@ -168,7 +171,9 @@ export default function (pi: ExtensionAPI) {
             ? `  comparisons/    — ${result.comparisonCount} structural comparisons`
             : "",
           "",
-          "To index into mempalace for semantic search, run graphwiki_index.",
+          "To index into mempalace for semantic search:",
+          "",
+          `  ctx_index(path: "${result.wikiDir}", source: "graphify-wiki")`,
         ]
           .filter(Boolean)
           .join("\n");
@@ -198,94 +203,69 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  // ── Tool: graphwiki_index ────────────────────────────────────────────
+  // ── Tool: graphwiki_status ───────────────────────────────────────────
   pi.registerTool({
-    name: "graphwiki_index",
-    label: "GraphWiki Index",
+    name: "graphwiki_status",
+    label: "GraphWiki Status",
     description:
-      "Index a generated graphwiki into mempalace's knowledge base via ctx_index. " +
-      "After indexing, you can search wiki content with ctx_search or memory_search.",
-    promptSnippet: "Index wiki docs into mempalace for semantic search",
-    parameters: Type.Object({
-      wikiDir: Type.Optional(
-        Type.String({
-          description:
-            "Path to the wiki directory to index. Defaults to the last generated wiki.",
-        })
-      ),
-    }),
+      "Show the status of the last wiki generation: how many nodes, " +
+      "communities, and files were generated, and the output directory.",
+    promptSnippet: "Check wiki generation status",
+    parameters: Type.Object({}),
     async execute(
       _toolCallId: string,
-      params: { wikiDir?: string },
+      _params: Record<string, never>,
       _signal: AbortSignal,
       _onUpdate: ((update: ToolResult) => void) | undefined,
       _ctx: unknown
     ): Promise<ToolResult> {
-      const wikiDir = params.wikiDir || state.lastWikiDir;
-
-      if (!wikiDir || !fs.existsSync(path.join(wikiDir, "INDEX.md"))) {
+      if (!state.lastWikiDir) {
         return {
           content: [
             {
               type: "text",
-              text:
-                "No wiki found to index. Generate one first with graphwiki_generate, " +
-                "or provide an explicit wikiDir path.",
+              text: "No wiki has been generated yet. Run graphwiki_generate first.",
             },
           ],
           details: {},
-          isError: true,
         };
       }
 
-      // Count files
-      let fileCount = 0;
-      const countFiles = (dir: string) => {
-        if (!fs.existsSync(dir)) return;
-        for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-          const fullPath = path.join(dir, entry.name);
-          if (entry.isDirectory()) {
-            countFiles(fullPath);
-          } else if (entry.name.endsWith(".md")) {
-            fileCount++;
-          }
-        }
-      };
-      countFiles(wikiDir);
-
-      // Signal the agent to run ctx_index on the wiki directory
-      // We return instructions rather than doing it ourselves because
-      // ctx_index is a tool in the agent's toolkit, not a direct function.
-      state.indexed = true;
+      const fileCount = countWikiFiles(state.lastWikiDir);
 
       return {
         content: [
           {
             type: "text",
             text: [
-              `**Wiki ready for indexing at \`${wikiDir}/\`**`,
-              `Found ${fileCount} markdown files.`,
+              `**GraphWiki Status**`,
               "",
-              "Run the following to index into mempalace:",
+              `- Graph dir: ${state.lastGraphDir}`,
+              `- Wiki dir: ${state.lastWikiDir}`,
+              `- Nodes wikified: ${state.lastNodeCount}`,
+              `- Wiki files: ${fileCount}`,
+              `- Indexed in mempalace: ${state.indexed ? "yes" : "no"}`,
               "",
-              `\`\`\``,
-              `ctx_index(path: "${wikiDir}", source: "graphify-wiki")`,
-              `\`\`\``,
+              "To index into mempalace for semantic search:",
               "",
-              "After indexing, these wiki pages are searchable via",
-              "ctx_search(queries: [...], source: \"graphify-wiki\")",
-              "or memory_search for cross-session recall.",
+              `  ctx_index(path: "${state.lastWikiDir}", source: "graphify-wiki")`,
             ].join("\n"),
           },
         ],
-        details: { fileCount, wikiDir },
+        details: {
+          graphDir: state.lastGraphDir,
+          wikiDir: state.lastWikiDir,
+          nodeCount: state.lastNodeCount,
+          fileCount,
+          indexed: state.indexed,
+        },
       };
     },
   });
 
   // ── Command: /graphwiki ──────────────────────────────────────────────
   pi.registerCommand("graphwiki", {
-    description: "GraphWiki commands: status, generate, reindex",
+    description: "GraphWiki commands: status, generate",
     handler: async (args: string, ctx) => {
       const parts = args.trim().split(/\s+/);
       const cmd = parts[0] || "status";
@@ -324,24 +304,8 @@ export default function (pi: ExtensionAPI) {
           break;
         }
 
-        case "reindex": {
-          if (!state.lastWikiDir) {
-            ctx.ui.notify("No wiki to reindex. Run generate first.", "error");
-            return;
-          }
-          state.indexed = true;
-          ctx.ui.notify(
-            `Wiki at ${state.lastWikiDir}/ marked for re-indexing. Run ctx_index to complete.`,
-            "info"
-          );
-          break;
-        }
-
         default:
-          ctx.ui.notify(
-            "Commands: status, generate [path], reindex",
-            "info"
-          );
+          ctx.ui.notify("Commands: status, generate [path]", "info");
       }
     },
   });
