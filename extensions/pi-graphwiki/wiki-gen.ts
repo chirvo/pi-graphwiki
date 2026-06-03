@@ -12,8 +12,6 @@ import { createHash } from "node:crypto";
 import type {
   GraphData,
   GraphNode,
-  GraphEdge,
-  GraphAnalysis,
   NodeWiki,
   SynthesizedEdge,
   CommunityWiki,
@@ -54,9 +52,16 @@ function slugify(label: string): string {
 }
 
 function escapeMd(text: string): string {
-  return text.replace(/[<>&]/g, (c) =>
-    c === "<" ? "&lt;" : c === ">" ? "&gt;" : "&amp;"
-  );
+  // Escape pipe (breaks tables), angle brackets (confuses browsers)
+  return text.replace(/[<>&|]/g, (c) => {
+    switch (c) {
+      case "<": return "&lt;";
+      case ">": return "&gt;";
+      case "&": return "&amp;";
+      case "|": return "&#124;";
+      default: return c;
+    }
+  });
 }
 
 // Simple Jaccard similarity between two string arrays
@@ -178,7 +183,7 @@ function loadData(graphDir: string): LoadedData {
 // ──────────────────────────────────────────────────────────────────────────
 
 function buildNodeWikis(data: LoadedData): NodeWiki[] {
-  const { graph, nodesById, nodeToCommunity, godNodeSet, surprisesBySource, surprisesByTarget } = data;
+  const { graph, nodesById, nodeToCommunity, godNodeSet } = data;
 
   // Build adjacency — single pass, O(E)
   const outgoing = new Map<string, SynthesizedEdge[]>();
@@ -497,16 +502,12 @@ function renderNodeWiki(nw: NodeWiki): string {
     lines.push("");
   }
 
-  // Surprising connections (matched by node ID, not slug)
+  // Surprising connections (s.reason has full human-readable description)
   if (nw.surprisingConnections.length > 0) {
     lines.push("## Surprising Connections");
     lines.push("");
     for (const s of nw.surprisingConnections) {
-      // s.source and s.target are graph node IDs, e.g. "app_main"
-      const isSource = s.source === nw.surprisingConnections[0]?.source; // context from caller
-      // Determine which end of the edge IS this node, and which is the "other"
-      // We need actual graph node IDs, not slugs. Pass via closure.
-      lines.push(`- → ${escapeMd(s.reason)}`);
+      lines.push(`- ${escapeMd(s.reason)}`);
     }
     lines.push("");
   }
@@ -514,9 +515,9 @@ function renderNodeWiki(nw: NodeWiki): string {
   return lines.join("\n");
 }
 
-function renderCommunityWiki(cw: CommunityWiki, communityLabel: string | null): string {
+function renderCommunityWiki(cw: CommunityWiki): string {
   const lines: string[] = [];
-  const label = communityLabel || cw.label;
+  const label = cw.label;
 
   lines.push(`# ${escapeMd(label)}`);
   lines.push("");
@@ -679,7 +680,7 @@ export function generateWiki(options: GenerateOptions): WikiGenResult {
     // Write community pages
     for (const cw of communityWikis) {
       const filePath = path.join(communitiesDir, `_${cw.id}.md`);
-      fs.writeFileSync(filePath, renderCommunityWiki(cw, null), "utf-8");
+      fs.writeFileSync(filePath, renderCommunityWiki(cw), "utf-8");
       generatedFiles.push(filePath);
     }
 
