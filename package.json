@@ -1,0 +1,31 @@
+{
+  "name": "pi-graphwiki",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Self-curating wiki from graphify knowledge graphs — generates concept, community, and comparison docs, indexed into mempalace for semantic search.",
+  "keywords": ["pi-package", "graphify", "wiki", "knowledge-graph", "mempalace"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/chirvo/pi-graphwiki.git"
+  },
+  "files": [
+    "extensions/",
+    "skills/",
+    "README.md"
+  ],
+  "pi": {
+    "extensions": ["./extensions"],
+    "skills": ["./skills"]
+  },
+  "dependencies": {},
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "@sinclair/typebox": "*"
+  },
+  "devDependencies": {
+    "@mariozechner/pi-coding-agent": "^0.65.0",
+    "@sinclair/typebox": "^0.34.41",
+    "typescript": "^6.0.2"
+  }
+}

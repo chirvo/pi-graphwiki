@@ -1,0 +1,5 @@
+node_modules/
+dist/
+.graphify_analysis.json
+.graphify_labels.json
+tests/.test-output/
